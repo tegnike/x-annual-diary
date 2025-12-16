@@ -1,0 +1,18 @@
+[
+  {
+    "tweet": {
+      "id_str": "2001",
+      "full_text": "今日からTypeScriptの勉強を始めた",
+      "created_at": "Mon Jan 06 10:00:00 +0000 2025",
+      "entities": {"hashtags": [], "user_mentions": [], "urls": []}
+    }
+  },
+  {
+    "tweet": {
+      "id_str": "2002",
+      "full_text": "型システムの便利さに感動している",
+      "created_at": "Wed Jan 08 15:00:00 +0000 2025",
+      "entities": {"hashtags": [], "user_mentions": [], "urls": []}
+    }
+  }
+]
