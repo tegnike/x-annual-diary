@@ -111,6 +111,16 @@ loadMonthlyPromptTemplate() {
     fi
 }
 
+# 日次プロンプトテンプレートを読み込む
+loadDailyPromptTemplate() {
+    local template_file="$TEMPLATES_DIR/daily-prompt.md"
+    if [[ -f "$template_file" ]]; then
+        cat "$template_file"
+    else
+        echo ""
+    fi
+}
+
 # テンプレート変数を置換する
 # 使用法: applyTemplate "$template" "VAR1=value1" "VAR2=value2"
 applyTemplate() {
@@ -243,7 +253,7 @@ extractImagesFromTweets() {
          })) +
 
          # 引用ツイートの画像
-         ([($tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url)] |
+         ([($tweet.entities.urls[]? | select(.expanded_url != null and (.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/"))) | .expanded_url)] |
           map(
             (. | extract_status_id) as $status_id |
             (find_tweet_by_id($status_id)) as $quoted |
@@ -277,10 +287,11 @@ analyzeImage() {
     fi
 }
 
-# 期間内のツイートの画像を解析
+# 期間内のツイートの画像を解析（並列処理対応）
 analyzeImagesForPeriod() {
     local tweets_json="$1"
     local period_label="$2"
+    local max_parallel="${3:-10}"  # デフォルト10並列
 
     if [[ "$ANALYZE_IMAGES" != "true" ]]; then
         return
@@ -298,8 +309,8 @@ analyzeImagesForPeriod() {
 
     echo "[Info] Found $image_count images in $period_label" >&2
 
-    # 各画像を解析
-    local analyzed=0
+    # キャッシュにない画像のみを抽出
+    local uncached_images=()
     local cached=0
     while IFS= read -r image_info; do
         local local_path
@@ -310,18 +321,89 @@ analyzeImagesForPeriod() {
         cached_desc=$(getFromCache "$local_path")
 
         if [[ -n "$cached_desc" ]]; then
-            ((cached++))
-            continue
+            cached=$((cached + 1))
+        else
+            uncached_images+=("$local_path")
+        fi
+    done < <(echo "$images" | jq -c '.[]')
+
+    local to_analyze=${#uncached_images[@]}
+    if [[ $to_analyze -eq 0 ]]; then
+        echo "[Info] Images - analyzed: 0, cached: $cached" >&2
+        return
+    fi
+
+    echo "[Info] Analyzing $to_analyze images in parallel (max $max_parallel concurrent)" >&2
+
+    # 並列処理用の一時ディレクトリ
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    # 画像パスを一時ファイルに書き出し
+    local paths_file="$tmp_dir/paths.txt"
+    printf '%s\n' "${uncached_images[@]}" > "$paths_file"
+
+    # xargsで並列実行（より安定した並列処理）
+    # analyzeImageをエクスポートできないため、インラインでclaude呼び出し
+    cat "$paths_file" | xargs -P "$max_parallel" -I {} bash -c '
+        local_path="$1"
+        tmp_dir="$2"
+        script_dir="$3"
+
+        # MD5ハッシュでファイル名生成
+        if command -v md5sum &>/dev/null; then
+            hash=$(echo "$local_path" | md5sum | cut -d" " -f1)
+        else
+            hash=$(echo "$local_path" | md5 -q)
+        fi
+        result_file="$tmp_dir/${hash}.json"
+
+        # 画像解析実行
+        prompt_template=$(cat "$script_dir/templates/image-prompt.md" 2>&1)
+        if [[ -z "$prompt_template" ]]; then
+            echo "[Error] Failed to read template: $script_dir/templates/image-prompt.md" >&2
+            description="（テンプレート読み込み失敗）"
+        else
+            prompt="${prompt_template//\{\{IMAGE_PATH\}\}/$local_path}"
+
+            error_log="$tmp_dir/error_${hash}.log"
+            if result=$(timeout 120 claude -p "$prompt" --output-format json 2>"$error_log"); then
+                description=$(echo "$result" | jq -r ".result // \"（解析失敗）\"")
+                if [[ "$description" == "（解析失敗）" || -z "$description" ]]; then
+                    echo "[Error] Parse failed for $local_path. Result: $result" >&2
+                fi
+            else
+                exit_code=$?
+                echo "[Error] claude failed for $local_path (exit: $exit_code)" >&2
+                if [[ -f "$error_log" ]]; then
+                    echo "[Error] Details: $(cat "$error_log")" >&2
+                fi
+                description="（解析失敗）"
+            fi
         fi
 
-        # 新規解析
-        echo "[Info] Analyzing image: $local_path" >&2
-        local description
-        description=$(analyzeImage "$local_path")
-        addToCache "$local_path" "$description"
-        ((analyzed++))
+        # 結果をJSONファイルに保存
+        jq -n --arg path "$local_path" --arg desc "$description" \
+            "{path: \$path, description: \$desc}" > "$result_file"
+        echo "[Info] Completed: $local_path" >&2
+    ' _ {} "$tmp_dir" "$SCRIPT_DIR"
 
-    done < <(echo "$images" | jq -c '.[]')
+    # 結果をキャッシュに統合
+    local analyzed=0
+    for result_file in "$tmp_dir"/*.json; do
+        if [[ -f "$result_file" && "$result_file" != "$tmp_dir/paths.txt" ]]; then
+            local path desc
+            path=$(jq -r '.path' "$result_file" 2>/dev/null) || continue
+            desc=$(jq -r '.description' "$result_file" 2>/dev/null) || continue
+            if [[ -n "$path" && "$path" != "null" ]]; then
+                addToCache "$path" "$desc"
+                analyzed=$((analyzed + 1))
+            fi
+        fi
+    done
+
+    # 一時ディレクトリを削除
+    rm -rf "$tmp_dir"
 
     if [[ $analyzed -gt 0 ]]; then
         saveImageCache
@@ -692,7 +774,7 @@ groupByWeek() {
 
 # 引用ツイートURLを抽出
 extractQuotedUrls() {
-    jq '[.tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url] // []'
+    jq '[.tweet.entities.urls[]? | select(.expanded_url != null and (.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/"))) | .expanded_url] // []'
 }
 
 # 画像キャッシュをJSON形式に変換
@@ -751,7 +833,7 @@ formatTweetsForContext() {
         .tweet as $tweet |
 
         # 引用ツイートURLを抽出
-        ([$tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url] // []) as $quote_urls |
+        ([$tweet.entities.urls[]? | select(.expanded_url != null and (.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/"))) | .expanded_url] // []) as $quote_urls |
 
         # 画像URLを抽出（photoのみ）
         ([($tweet.extended_entities.media // [])[] | select(.type == "photo") | .media_url_https] // []) as $image_urls |
@@ -1100,6 +1182,70 @@ saveWeeklySummary() {
 }
 
 # =============================================================================
+# 日次処理（DailyProcessor拡張）
+# =============================================================================
+
+# Claude Code用コンテキスト構築（日次用）
+buildDailyContext() {
+    local tweets="$1"
+    local cumulative_summary="$2"
+    local glossary="$3"
+    local month="$4"
+    local date="$5"  # YYYY-MM-DD形式
+
+    # 日付から日を抽出（例: 2025-01-15 → 15）
+    local day="${date##*-}"
+    day=$((10#$day))  # 先頭の0を除去
+
+    # テンプレートファイルを読み込み
+    local template
+    template=$(loadDailyPromptTemplate)
+
+    # テンプレートが存在しない場合はフォールバック（週次を流用）
+    if [[ -z "$template" ]]; then
+        buildWeeklyContext "$tweets" "$cumulative_summary" "$glossary" "$month" "$date"
+        return
+    fi
+
+    # テンプレート変数を置換
+    local result="$template"
+    result="${result//\{\{YEAR\}\}/$YEAR}"
+    result="${result//\{\{MONTH\}\}/$month}"
+    result="${result//\{\{DATE\}\}/$day}"
+    result="${result//\{\{TWEETS\}\}/$tweets}"
+    result="${result//\{\{CUMULATIVE_SUMMARY\}\}/$cumulative_summary}"
+    result="${result//\{\{GLOSSARY\}\}/$glossary}"
+
+    echo "$result"
+}
+
+# 日次レポート生成（Claude Code実行）
+processDay() {
+    local day_tweets="$1"
+    local cumulative_summary="$2"
+    local glossary="$3"
+    local month="$4"
+    local target_date="$5"  # YYYY-MM-DD形式
+
+    local context
+    context=$(buildDailyContext "$day_tweets" "$cumulative_summary" "$glossary" "$month" "$target_date")
+
+    # Claude Code実行（非対話モード）
+    local identifier="$target_date"
+    local result
+    if result=$(invokeClaudeCode "$context" 300 "daily" "$identifier"); then
+        echo "$result"
+    else
+        local day="${target_date##*-}"
+        day=$((10#$day))
+        echo "[Warning] Claude Code execution failed for $target_date" >&2
+        echo "## 日次サマリー（${YEAR}年${month}月${day}日）
+
+処理中にエラーが発生しました。"
+    fi
+}
+
+# =============================================================================
 # 月次処理（MonthlyAggregator）
 # =============================================================================
 
@@ -1200,6 +1346,26 @@ loadWeeklySummaries() {
     local summaries=""
 
     for file in "$YEAR_OUTPUT_DIR/weekly-summaries/${year}-W"*.md; do
+        if [[ -f "$file" ]]; then
+            summaries+="$(cat "$file")\n\n"
+        fi
+    done
+
+    echo -e "$summaries"
+}
+
+# 当該月の日次サマリー読み込み（時系列順）
+# 引数: 年, 月
+# 出力: 当該月に属する日次サマリーの結合テキスト
+loadDailySummariesForMonth() {
+    local year="$1"
+    local month="$2"
+    local summaries=""
+    local month_padded
+    month_padded=$(printf "%02d" "$month")
+
+    # 日付順にソートしてファイルを読み込む
+    for file in "$YEAR_OUTPUT_DIR/daily-summaries/${year}-${month_padded}-"*.md; do
         if [[ -f "$file" ]]; then
             summaries+="$(cat "$file")\n\n"
         fi
@@ -1313,12 +1479,24 @@ EOF
         return
     fi
 
+    # 粒度に応じた表示名を設定
+    local period_type period_unit
+    if [[ "$GRANULARITY" == "daily" ]]; then
+        period_type="日次"
+        period_unit="日"
+    else
+        period_type="週次"
+        period_unit="週"
+    fi
+
     # テンプレート変数を置換
     local result="$template"
     result="${result//\{\{YEAR\}\}/$YEAR}"
     result="${result//\{\{MONTH\}\}/$month}"
     result="${result//\{\{WEEKLY_SUMMARIES\}\}/$weekly_summaries}"
     result="${result//\{\{PREVIOUS_SUMMARIES\}\}/$previous_summaries}"
+    result="${result//\{\{PERIOD_TYPE\}\}/$period_type}"
+    result="${result//\{\{PERIOD_UNIT\}\}/$period_unit}"
 
     echo "$result"
 }
@@ -1330,9 +1508,13 @@ aggregateMonth() {
     local month="$1"
     local previous_summaries="$2"
 
-    # 新しい関数を使用して週次サマリーを読み込む（月別フィルタリング）
+    # 粒度に応じてサマリーを読み込む
     local weekly_summaries
-    weekly_summaries=$(loadWeeklySummariesForMonth "$YEAR" "$month")
+    if [[ "$GRANULARITY" == "daily" ]]; then
+        weekly_summaries=$(loadDailySummariesForMonth "$YEAR" "$month")
+    else
+        weekly_summaries=$(loadWeeklySummariesForMonth "$YEAR" "$month")
+    fi
 
     # 過去月のサマリーが渡されていない場合は自動取得
     if [[ -z "$previous_summaries" && "$month" -gt 1 ]]; then
@@ -1614,12 +1796,14 @@ main() {
                 # 画像解析
                 analyzeImagesForPeriod "$day_tweets" "$target_date"
 
+                echo "[Debug] Formatting tweets for $target_date..." >&2
                 local formatted_tweets
                 formatted_tweets=$(echo "$day_tweets" | formatTweetsForContext)
+                echo "[Debug] Formatting complete. Calling Claude Code..." >&2
 
-                # 日次サマリー生成（processWeekを流用、week_numの代わりに日付を使用）
+                # 日次サマリー生成
                 local day_summary
-                day_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$target_date")
+                day_summary=$(processDay "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$target_date")
 
                 saveDailySummary "$day_summary" "$target_date"
 
