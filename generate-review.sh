@@ -15,6 +15,7 @@ TWEETS_FILE="$SCRIPT_DIR/twitter-*/data/tweets.js"
 YEAR="2025"
 MONTH=""  # 空の場合は全月処理
 GRANULARITY="weekly"  # weekly or daily
+ANNUAL_ONLY=""  # 年次サマリーのみ生成
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/output}"
 TEMPLATES_DIR="${TEMPLATES_DIR:-$SCRIPT_DIR/templates}"
 
@@ -30,6 +31,7 @@ Options:
   -y, --year <year>         Target year (default: 2025)
   -m, --month <month>       Target month (1-12, default: all months)
   -g, --granularity <type>  Grouping: weekly or daily (default: weekly)
+  -a, --annual-only         Generate annual summary from existing monthly reports
   -h, --help                Show this help message
 EOF
 }
@@ -51,6 +53,10 @@ while [[ $# -gt 0 ]]; do
         -g|--granularity)
             GRANULARITY="$2"
             shift 2
+            ;;
+        -a|--annual-only)
+            ANNUAL_ONLY="true"
+            shift
             ;;
         -h|--help)
             showUsage
@@ -955,6 +961,34 @@ loadPreviousMonthlySummaries() {
     echo -e "$summaries"
 }
 
+# 全月次レポートを読み込み（年次サマリー生成用）
+# 引数: 年
+# 出力: 全月のサマリーを結合したテキスト
+loadAllMonthlySummaries() {
+    local year="$1"
+    local summaries=""
+    local found_count=0
+
+    for month in $(seq 1 12); do
+        local filename
+        filename=$(getMonthlyFilename "$year" "$month")
+        local filepath="$OUTPUT_DIR/$year/$filename"
+
+        if [[ -f "$filepath" ]]; then
+            summaries+="## ${month}月\n"
+            summaries+="$(cat "$filepath")\n\n"
+            ((found_count++))
+        fi
+    done
+
+    if [[ $found_count -eq 0 ]]; then
+        echo ""
+        return 1
+    fi
+
+    echo -e "$summaries"
+}
+
 # 月次レポート用コンテキスト構築
 # 引数: 月, 週次サマリー, 過去月サマリー
 # 出力: Claude Code用プロンプト
@@ -1168,6 +1202,34 @@ main() {
     echo "========================================"
     echo "Twitter Annual Review Generator"
     echo "========================================"
+
+    # 年次サマリーのみ生成モード
+    if [[ -n "$ANNUAL_ONLY" ]]; then
+        echo "[Info] Annual summary only mode"
+        YEAR_OUTPUT_DIR="$OUTPUT_DIR/$YEAR"
+
+        if [[ ! -d "$YEAR_OUTPUT_DIR" ]]; then
+            exitWithError "Output directory not found: $YEAR_OUTPUT_DIR"
+        fi
+
+        echo "[Info] Loading existing monthly reports..."
+        local cumulative_summary
+        if ! cumulative_summary=$(loadAllMonthlySummaries "$YEAR"); then
+            exitWithError "No monthly reports found in $YEAR_OUTPUT_DIR"
+        fi
+
+        local report_count
+        report_count=$(ls -1 "$YEAR_OUTPUT_DIR"/*-review.md 2>/dev/null | wc -l | tr -d ' ')
+        echo "[Info] Found $report_count monthly reports"
+
+        echo "[Info] Generating annual summary..."
+        generateAnnualSummary "$cumulative_summary"
+
+        echo "========================================"
+        echo "Annual summary generated successfully!"
+        echo "========================================"
+        return 0
+    fi
 
     # バリデーション
     validateInput
