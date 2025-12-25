@@ -200,14 +200,27 @@ addToCache() {
 # ツイートから画像URLを抽出（photoのみ、引用ツイート含む）
 extractImagesFromTweets() {
     local tweets_json="$1"
-    echo "$tweets_json" | jq -r --argjson allTweets "${ALL_TWEETS_JSON:-[]}" '
+
+    # 一時ファイルが存在する場合は--slurpfile、存在しない場合は--argjsonを使用
+    local all_tweets_arg=""
+    if [[ -n "$ALL_TWEETS_FILE" && -f "$ALL_TWEETS_FILE" ]]; then
+        all_tweets_arg="--slurpfile allTweets $ALL_TWEETS_FILE"
+    else
+        all_tweets_arg="--argjson allTweets []"
+    fi
+
+    echo "$tweets_json" | jq -r $all_tweets_arg '
         # 引用ツイートのステータスIDを抽出する関数
         def extract_status_id:
             capture("(?:x\\.com|twitter\\.com)/[^/]+/status/(?<id>[0-9]+)") | .id;
 
+        # allTweetsを正規化（--slurpfileの場合は[0]、--argjsonの場合はそのまま）
+        def normalize_all_tweets:
+            if ($allTweets | type) == "array" and ($allTweets | length) > 0 and ($allTweets[0] | type) == "array" then $allTweets[0] else $allTweets end;
+
         # ステータスIDから該当ツイートを検索
         def find_tweet_by_id(id):
-            $allTweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
+            normalize_all_tweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
 
         # ツイートから画像を抽出
         def extract_images(tweet):
@@ -684,20 +697,32 @@ getImageCacheJson() {
 
 # ツイートデータを整形して出力（引用ツイート・画像対応版）
 # 引数: 全ツイートJSON（引用元検索用）を標準入力で受け取る
-# グローバル変数 ALL_TWEETS_JSON を参照して引用元を検索
+# グローバル変数 ALL_TWEETS_FILE を参照して引用元を検索
 # グローバル変数 IMAGE_CACHE を参照して画像説明を取得
 formatTweetsForContext() {
     local image_cache_json
     image_cache_json=$(getImageCacheJson)
 
-    jq -r --argjson allTweets "${ALL_TWEETS_JSON:-[]}" --argjson imageCache "$image_cache_json" '
+    # 一時ファイルが存在しない場合は空配列を使用
+    local all_tweets_arg=""
+    if [[ -n "$ALL_TWEETS_FILE" && -f "$ALL_TWEETS_FILE" ]]; then
+        all_tweets_arg="--slurpfile allTweets $ALL_TWEETS_FILE"
+    else
+        all_tweets_arg="--argjson allTweets []"
+    fi
+
+    jq -r $all_tweets_arg --argjson imageCache "$image_cache_json" '
         # 引用ツイートのステータスIDを抽出する関数
         def extract_status_id:
             capture("(?:x\\.com|twitter\\.com)/[^/]+/status/(?<id>[0-9]+)") | .id;
 
+        # allTweetsを正規化（--slurpfileの場合は[0]、--argjsonの場合はそのまま）
+        def normalize_all_tweets:
+            if ($allTweets | type) == "array" and ($allTweets | length) > 0 and ($allTweets[0] | type) == "array" then $allTweets[0] else $allTweets end;
+
         # ステータスIDから該当ツイートを検索
         def find_tweet_by_id(id):
-            $allTweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
+            normalize_all_tweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
 
         # 画像説明を取得
         def get_image_description(url):
@@ -1477,9 +1502,10 @@ main() {
     tweet_count=$(echo "$filtered_tweets" | jq 'length')
     echo "[Info] Found $tweet_count tweets for year $YEAR"
 
-    # 引用ツイート検索用にグローバル変数として設定
-    ALL_TWEETS_JSON="$tweets_json"
-    export ALL_TWEETS_JSON
+    # 引用ツイート検索用に一時ファイルに保存（シェル変数サイズ制限回避）
+    ALL_TWEETS_FILE="$YEAR_OUTPUT_DIR/.all_tweets_tmp.json"
+    echo "$tweets_json" > "$ALL_TWEETS_FILE"
+    export ALL_TWEETS_FILE
 
     # 画像キャッシュの読み込み
     if [[ "$ANALYZE_IMAGES" == "true" ]]; then
@@ -1701,6 +1727,12 @@ main() {
 
     # トークン・コスト・時間の統計を出力・保存
     saveStatsSummary
+
+    # 一時ファイルのクリーンアップ
+    if [[ -n "$ALL_TWEETS_FILE" && -f "$ALL_TWEETS_FILE" ]]; then
+        rm -f "$ALL_TWEETS_FILE"
+        echo "[Info] Cleaned up temporary files"
+    fi
 
     echo "========================================"
 }
