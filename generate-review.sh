@@ -464,9 +464,45 @@ extractQuotedUrls() {
     jq '[.tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url] // []'
 }
 
-# ツイートデータを整形して出力
+# ツイートデータを整形して出力（引用ツイート対応版）
+# 引数: 全ツイートJSON（引用元検索用）を標準入力で受け取る
+# グローバル変数 ALL_TWEETS_JSON を参照して引用元を検索
 formatTweetsForContext() {
-    jq -r '.[] | "---\n日時: \(.tweet.created_at)\n本文: \(.tweet.full_text)\n---"'
+    jq -r --argjson allTweets "${ALL_TWEETS_JSON:-[]}" '
+        # 引用ツイートのステータスIDを抽出する関数
+        def extract_status_id:
+            capture("(?:x\\.com|twitter\\.com)/[^/]+/status/(?<id>[0-9]+)") | .id;
+
+        # ステータスIDから該当ツイートを検索
+        def find_tweet_by_id(id):
+            $allTweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
+
+        .[] |
+        .tweet as $tweet |
+
+        # 引用ツイートURLを抽出
+        ([$tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url] // []) as $quote_urls |
+
+        # 基本情報
+        "---\n日時: \($tweet.created_at)\n本文: \($tweet.full_text)" +
+
+        # 引用ツイートがあれば追加
+        if ($quote_urls | length) > 0 then
+            ($quote_urls | map(
+                . as $url |
+                ($url | extract_status_id) as $status_id |
+                (find_tweet_by_id($status_id)) as $quoted |
+                if $quoted != null then
+                    "\n\n  ┗ 引用ツイート:\n    日時: \($quoted.tweet.created_at)\n    本文: \($quoted.tweet.full_text | gsub("\n"; "\n    "))"
+                else
+                    "\n\n  ┗ 引用URL: \($url)"
+                end
+            ) | join(""))
+        else
+            ""
+        end +
+        "\n---"
+    '
 }
 
 # =============================================================================
@@ -1067,6 +1103,10 @@ main() {
     local tweet_count
     tweet_count=$(echo "$filtered_tweets" | jq 'length')
     echo "[Info] Found $tweet_count tweets for year $YEAR"
+
+    # 引用ツイート検索用にグローバル変数として設定
+    ALL_TWEETS_JSON="$tweets_json"
+    export ALL_TWEETS_JSON
 
     if [[ "$tweet_count" -eq 0 ]]; then
         echo "[Warning] No tweets found for year $YEAR"
