@@ -13,6 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # デフォルト値
 TWEETS_FILE="$SCRIPT_DIR/twitter-*/data/tweets.js"
 YEAR="2025"
+MONTH=""  # 空の場合は全月処理
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/output}"
 TEMPLATES_DIR="${TEMPLATES_DIR:-$SCRIPT_DIR/templates}"
 
@@ -24,9 +25,10 @@ showUsage() {
 Usage: $(basename "$0") [options]
 
 Options:
-  -f, --file <path>   tweets.js file path (default: twitter-*/data/tweets.js)
-  -y, --year <year>   Target year (default: 2025)
-  -h, --help          Show this help message
+  -f, --file <path>    tweets.js file path (default: twitter-*/data/tweets.js)
+  -y, --year <year>    Target year (default: 2025)
+  -m, --month <month>  Target month (1-12, default: all months)
+  -h, --help           Show this help message
 EOF
 }
 
@@ -38,6 +40,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -y|--year)
             YEAR="$2"
+            shift 2
+            ;;
+        -m|--month)
+            MONTH="$2"
             shift 2
             ;;
         -h|--help)
@@ -1140,8 +1146,16 @@ main() {
         echo "[Info] Previous year summary loaded as initial context"
     fi
 
-    # 月ループ（1〜12月）
-    for month in {1..12}; do
+    # 月ループ（指定月のみ or 1〜12月）
+    local month_list
+    if [[ -n "$MONTH" ]]; then
+        month_list="$MONTH"
+        echo "[Info] Processing only month $MONTH"
+    else
+        month_list=$(seq 1 12)
+    fi
+
+    for month in $month_list; do
         showProgress "$month"
 
         # 当該月のツイート抽出
@@ -1229,9 +1243,13 @@ main() {
         cumulative_summary="${cumulative_summary}\n## ${month}月\n${monthly_report}\n"
     done
 
-    # 年間サマリー生成
-    echo "[Info] Generating annual summary..."
-    generateAnnualSummary "$cumulative_summary"
+    # 年間サマリー生成（単月指定時はスキップ）
+    if [[ -z "$MONTH" ]]; then
+        echo "[Info] Generating annual summary..."
+        generateAnnualSummary "$cumulative_summary"
+    else
+        echo "[Info] Skipping annual summary (single month mode)"
+    fi
 
     # 辞書保存
     saveGlossary "$YEAR_OUTPUT_DIR/glossary.json" "$glossary"
