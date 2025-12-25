@@ -16,6 +16,7 @@ YEAR="2025"
 MONTH=""  # 空の場合は全月処理
 GRANULARITY="weekly"  # weekly or daily
 ANNUAL_ONLY=""  # 年次サマリーのみ生成
+ANALYZE_IMAGES="false"  # 画像解析を有効化
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/output}"
 TEMPLATES_DIR="${TEMPLATES_DIR:-$SCRIPT_DIR/templates}"
 
@@ -32,6 +33,7 @@ Options:
   -m, --month <month>       Target month (1-12, default: all months)
   -g, --granularity <type>  Grouping: weekly or daily (default: weekly)
   -a, --annual-only         Generate annual summary from existing monthly reports
+  -i, --image               Analyze images using subagent (default: disabled)
   -h, --help                Show this help message
 EOF
 }
@@ -56,6 +58,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -a|--annual-only)
             ANNUAL_ONLY="true"
+            shift
+            ;;
+        -i|--image)
+            ANALYZE_IMAGES="true"
             shift
             ;;
         -h|--help)
@@ -118,6 +124,180 @@ applyTemplate() {
     done
 
     echo "$result"
+}
+
+# =============================================================================
+# 画像キャッシュ管理
+# =============================================================================
+
+# グローバル変数
+declare -A IMAGE_CACHE
+
+# キャッシュファイルパス
+getImageCachePath() {
+    echo "$YEAR_OUTPUT_DIR/image-cache.json"
+}
+
+# キャッシュ読み込み
+loadImageCache() {
+    local cache_file
+    cache_file=$(getImageCachePath)
+
+    if [[ -f "$cache_file" ]]; then
+        while IFS= read -r line; do
+            local url desc
+            url=$(echo "$line" | jq -r '.url')
+            desc=$(echo "$line" | jq -r '.description')
+            if [[ -n "$url" && "$url" != "null" ]]; then
+                IMAGE_CACHE["$url"]="$desc"
+            fi
+        done < <(jq -c '.[]' "$cache_file" 2>/dev/null)
+        echo "[Info] Loaded ${#IMAGE_CACHE[@]} cached image descriptions" >&2
+    fi
+}
+
+# キャッシュ保存
+saveImageCache() {
+    local cache_file
+    cache_file=$(getImageCachePath)
+
+    local json_array="["
+    local first=true
+    for url in "${!IMAGE_CACHE[@]}"; do
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            json_array+=","
+        fi
+        local desc="${IMAGE_CACHE[$url]}"
+        # JSONエスケープ
+        desc=$(echo "$desc" | jq -Rs '.')
+        json_array+="{\"url\":\"$url\",\"description\":$desc}"
+    done
+    json_array+="]"
+
+    echo "$json_array" | jq '.' > "$cache_file"
+    echo "[Info] Saved ${#IMAGE_CACHE[@]} image descriptions to cache" >&2
+}
+
+# キャッシュから取得
+getFromCache() {
+    local url="$1"
+    echo "${IMAGE_CACHE[$url]:-}"
+}
+
+# キャッシュに追加
+addToCache() {
+    local url="$1"
+    local description="$2"
+    IMAGE_CACHE["$url"]="$description"
+}
+
+# =============================================================================
+# 画像解析関数
+# =============================================================================
+
+# ツイートから画像URLを抽出（photoのみ、引用ツイート含む）
+extractImagesFromTweets() {
+    local tweets_json="$1"
+    echo "$tweets_json" | jq -r --argjson allTweets "${ALL_TWEETS_JSON:-[]}" '
+        # 引用ツイートのステータスIDを抽出する関数
+        def extract_status_id:
+            capture("(?:x\\.com|twitter\\.com)/[^/]+/status/(?<id>[0-9]+)") | .id;
+
+        # ステータスIDから該当ツイートを検索
+        def find_tweet_by_id(id):
+            $allTweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
+
+        # ツイートから画像を抽出
+        def extract_images(tweet):
+            [(tweet.extended_entities.media // [])[] | select(.type == "photo") | .media_url_https] // [];
+
+        [.[] |
+         .tweet as $tweet |
+
+         # メインツイートの画像
+         (extract_images($tweet) | map({tweet_id: $tweet.id_str, media_url: .})) +
+
+         # 引用ツイートの画像
+         ([($tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url)] |
+          map(
+            (. | extract_status_id) as $status_id |
+            (find_tweet_by_id($status_id)) as $quoted |
+            if $quoted != null then
+              extract_images($quoted.tweet) | map({tweet_id: $quoted.tweet.id_str, media_url: .})
+            else
+              []
+            end
+          ) | flatten)
+        ] | flatten | unique_by(.media_url)
+    '
+}
+
+# 単一画像を解析
+analyzeImage() {
+    local media_url="$1"
+    local timeout="${2:-60}"
+
+    local result
+    if result=$(timeout "$timeout" claude -p "この画像の内容を50文字以内で簡潔に日本語で説明してください。イラスト、写真、スクリーンショットなど種類も含めて。" --image "$media_url" --output-format json 2>/dev/null); then
+        echo "$result" | jq -r '.result // "（解析失敗）"'
+    else
+        echo "（解析失敗）"
+    fi
+}
+
+# 期間内のツイートの画像を解析
+analyzeImagesForPeriod() {
+    local tweets_json="$1"
+    local period_label="$2"
+
+    if [[ "$ANALYZE_IMAGES" != "true" ]]; then
+        return
+    fi
+
+    # 画像を抽出
+    local images
+    images=$(extractImagesFromTweets "$tweets_json")
+    local image_count
+    image_count=$(echo "$images" | jq 'length')
+
+    if [[ "$image_count" -eq 0 ]]; then
+        return
+    fi
+
+    echo "[Info] Found $image_count images in $period_label" >&2
+
+    # 各画像を解析
+    local analyzed=0
+    local cached=0
+    while IFS= read -r image_info; do
+        local media_url
+        media_url=$(echo "$image_info" | jq -r '.media_url')
+
+        # キャッシュ確認
+        local cached_desc
+        cached_desc=$(getFromCache "$media_url")
+
+        if [[ -n "$cached_desc" ]]; then
+            ((cached++))
+            continue
+        fi
+
+        # 新規解析
+        echo "[Info] Analyzing image: $media_url" >&2
+        local description
+        description=$(analyzeImage "$media_url")
+        addToCache "$media_url" "$description"
+        ((analyzed++))
+
+    done < <(echo "$images" | jq -c '.[]')
+
+    if [[ $analyzed -gt 0 ]]; then
+        saveImageCache
+    fi
+
+    echo "[Info] Images - analyzed: $analyzed, cached: $cached" >&2
 }
 
 # =============================================================================
@@ -483,11 +663,34 @@ extractQuotedUrls() {
     jq '[.tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url] // []'
 }
 
-# ツイートデータを整形して出力（引用ツイート対応版）
+# 画像キャッシュをJSON形式に変換
+getImageCacheJson() {
+    local json_obj="{"
+    local first=true
+    for url in "${!IMAGE_CACHE[@]}"; do
+        if [[ "$first" == "true" ]]; then
+            first=false
+        else
+            json_obj+=","
+        fi
+        local desc="${IMAGE_CACHE[$url]}"
+        # JSONエスケープ
+        desc=$(echo "$desc" | jq -Rs '.')
+        json_obj+="\"$url\":$desc"
+    done
+    json_obj+="}"
+    echo "$json_obj"
+}
+
+# ツイートデータを整形して出力（引用ツイート・画像対応版）
 # 引数: 全ツイートJSON（引用元検索用）を標準入力で受け取る
 # グローバル変数 ALL_TWEETS_JSON を参照して引用元を検索
+# グローバル変数 IMAGE_CACHE を参照して画像説明を取得
 formatTweetsForContext() {
-    jq -r --argjson allTweets "${ALL_TWEETS_JSON:-[]}" '
+    local image_cache_json
+    image_cache_json=$(getImageCacheJson)
+
+    jq -r --argjson allTweets "${ALL_TWEETS_JSON:-[]}" --argjson imageCache "$image_cache_json" '
         # 引用ツイートのステータスIDを抽出する関数
         def extract_status_id:
             capture("(?:x\\.com|twitter\\.com)/[^/]+/status/(?<id>[0-9]+)") | .id;
@@ -496,14 +699,37 @@ formatTweetsForContext() {
         def find_tweet_by_id(id):
             $allTweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
 
+        # 画像説明を取得
+        def get_image_description(url):
+            $imageCache[url] // null;
+
         .[] |
         .tweet as $tweet |
 
         # 引用ツイートURLを抽出
         ([$tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url] // []) as $quote_urls |
 
+        # 画像URLを抽出（photoのみ）
+        ([($tweet.extended_entities.media // [])[] | select(.type == "photo") | .media_url_https] // []) as $image_urls |
+
         # 基本情報
         "---\n日時: \($tweet.created_at)\n本文: \($tweet.full_text)" +
+
+        # 添付画像があれば追加
+        if ($image_urls | length) > 0 then
+            "\n添付画像:" +
+            ($image_urls | map(
+                . as $url |
+                (get_image_description($url)) as $desc |
+                if $desc != null then
+                    "\n  - \($desc)"
+                else
+                    ""
+                end
+            ) | join(""))
+        else
+            ""
+        end +
 
         # 引用ツイートがあれば追加
         if ($quote_urls | length) > 0 then
@@ -1255,6 +1481,12 @@ main() {
     ALL_TWEETS_JSON="$tweets_json"
     export ALL_TWEETS_JSON
 
+    # 画像キャッシュの読み込み
+    if [[ "$ANALYZE_IMAGES" == "true" ]]; then
+        echo "[Info] Image analysis enabled"
+        loadImageCache
+    fi
+
     if [[ "$tweet_count" -eq 0 ]]; then
         echo "[Warning] No tweets found for year $YEAR"
         exit 0
@@ -1334,6 +1566,9 @@ main() {
 
                 echo "[Info] Processing $day_tweet_count tweets for $target_date"
 
+                # 画像解析
+                analyzeImagesForPeriod "$day_tweets" "$target_date"
+
                 local formatted_tweets
                 formatted_tweets=$(echo "$day_tweets" | formatTweetsForContext)
 
@@ -1357,6 +1592,9 @@ main() {
                 # 週番号が取得できない場合は月全体を1つとして処理
                 local week_num=1
                 showProgress "$month" "$week_num"
+
+                # 画像解析
+                analyzeImagesForPeriod "$month_tweets" "${YEAR}年${month}月第${week_num}週"
 
                 local formatted_tweets
                 formatted_tweets=$(echo "$month_tweets" | formatTweetsForContext)
@@ -1389,6 +1627,9 @@ main() {
                     fi
 
                     echo "[Info] Processing $week_tweet_count tweets for week $week_num"
+
+                    # 画像解析
+                    analyzeImagesForPeriod "$week_tweets" "${YEAR}年${month}月第${week_counter}週"
 
                     local formatted_tweets
                     formatted_tweets=$(echo "$week_tweets" | formatTweetsForContext)
