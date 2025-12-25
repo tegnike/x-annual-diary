@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # generate-review.sh
 # Twitter年間振り返りレポート自動生成スクリプト
 # Usage: ./generate-review.sh [--file tweets.js] [--year 2025]
@@ -924,7 +924,7 @@ extractDateFromTwitter() {
         fi
     done
 
-    printf "%s-%s-%s" "$year" "$month_num" "$day"
+    printf "%s-%s-%s\n" "$year" "$month_num" "$day"
 }
 
 # 月内の日付リストを取得
