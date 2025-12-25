@@ -14,6 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TWEETS_FILE="$SCRIPT_DIR/twitter-*/data/tweets.js"
 YEAR="2025"
 MONTH=""  # 空の場合は全月処理
+GRANULARITY="weekly"  # weekly or daily
 OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/output}"
 TEMPLATES_DIR="${TEMPLATES_DIR:-$SCRIPT_DIR/templates}"
 
@@ -25,10 +26,11 @@ showUsage() {
 Usage: $(basename "$0") [options]
 
 Options:
-  -f, --file <path>    tweets.js file path (default: twitter-*/data/tweets.js)
-  -y, --year <year>    Target year (default: 2025)
-  -m, --month <month>  Target month (1-12, default: all months)
-  -h, --help           Show this help message
+  -f, --file <path>         tweets.js file path (default: twitter-*/data/tweets.js)
+  -y, --year <year>         Target year (default: 2025)
+  -m, --month <month>       Target month (1-12, default: all months)
+  -g, --granularity <type>  Grouping: weekly or daily (default: weekly)
+  -h, --help                Show this help message
 EOF
 }
 
@@ -44,6 +46,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--month)
             MONTH="$2"
+            shift 2
+            ;;
+        -g|--granularity)
+            GRANULARITY="$2"
             shift 2
             ;;
         -h|--help)
@@ -171,6 +177,7 @@ ensureOutputDir() {
     local year_dir="$OUTPUT_DIR/$YEAR"
     mkdir -p "$year_dir"
     mkdir -p "$year_dir/weekly-summaries"
+    mkdir -p "$year_dir/daily-summaries"
     mkdir -p "$year_dir/logs"
 
     # YEAR_OUTPUT_DIRをグローバルに設定
@@ -613,6 +620,78 @@ getWeekTweets() {
             echo "$tweet"
         fi
     done | jq -s '.'
+}
+
+# =============================================================================
+# 日次処理（DailyProcessor）
+# =============================================================================
+
+# Twitter日付から日付部分（YYYY-MM-DD）を抽出
+# 引数: Twitter形式日付 "Mon Dec 08 22:15:13 +0000 2025"
+# 出力: "2025-12-08"
+extractDateFromTwitter() {
+    local date_str="$1"
+    local month_map="Jan:01 Feb:02 Mar:03 Apr:04 May:05 Jun:06 Jul:07 Aug:08 Sep:09 Oct:10 Nov:11 Dec:12"
+
+    local parts=($date_str)
+    local month_name="${parts[1]}"
+    local day="${parts[2]}"
+    local year="${parts[5]}"
+
+    local month_num=""
+    for mapping in $month_map; do
+        local name="${mapping%:*}"
+        local num="${mapping#*:}"
+        if [[ "$month_name" == "$name" ]]; then
+            month_num="$num"
+            break
+        fi
+    done
+
+    printf "%s-%s-%s" "$year" "$month_num" "$day"
+}
+
+# 月内の日付リストを取得
+# 引数: ツイートJSON配列, 月番号
+# 出力: 日付のリスト（YYYY-MM-DD形式、スペース区切り）
+getDaysInMonth() {
+    local tweets_json="$1"
+    local month="$2"
+    local month_names=("" "Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec")
+    local month_name="${month_names[$month]}"
+
+    echo "$tweets_json" | jq -r --arg month "$month_name" '
+        [.[] | select(.tweet.created_at | contains($month)) | .tweet.created_at] | unique | .[]
+    ' | while read -r date_str; do
+        extractDateFromTwitter "$date_str"
+    done | sort | uniq
+}
+
+# 指定日のツイートを取得
+# 引数: ツイートJSON配列, 日付（YYYY-MM-DD）
+# 出力: 当該日のツイートJSON配列
+getDayTweets() {
+    local tweets_json="$1"
+    local target_date="$2"
+
+    echo "$tweets_json" | jq -c '.[]' | while read -r tweet; do
+        local date_str
+        date_str=$(echo "$tweet" | jq -r '.tweet.created_at')
+        local tweet_date
+        tweet_date=$(extractDateFromTwitter "$date_str")
+        if [[ "$tweet_date" == "$target_date" ]]; then
+            echo "$tweet"
+        fi
+    done | jq -s '.'
+}
+
+# 日次サマリーを保存
+saveDailySummary() {
+    local summary="$1"
+    local date="$2"  # YYYY-MM-DD形式
+    local output_file="$YEAR_OUTPUT_DIR/daily-summaries/${date}.md"
+    echo "$summary" > "$output_file"
+    echo "[Info] Saved: $output_file"
 }
 
 # Claude Code CLI実行
@@ -1170,64 +1249,101 @@ main() {
             continue
         fi
 
-        echo "[Info] Processing $month_tweet_count tweets for month $month"
+        echo "[Info] Processing $month_tweet_count tweets for month $month (granularity: $GRANULARITY)"
 
-        # 週単位処理
-        local weeks_in_month
-        weeks_in_month=$(getWeeksInMonth "$filtered_tweets" "$month")
+        if [[ "$GRANULARITY" == "daily" ]]; then
+            # 日単位処理
+            local days_in_month
+            days_in_month=$(getDaysInMonth "$filtered_tweets" "$month")
 
-        if [[ -z "$weeks_in_month" ]]; then
-            # 週番号が取得できない場合は月全体を1つとして処理
-            local week_num=1
-            showProgress "$month" "$week_num"
+            for target_date in $days_in_month; do
+                echo "[Progress] Processing: $target_date"
 
-            local formatted_tweets
-            formatted_tweets=$(echo "$month_tweets" | formatTweetsForContext)
+                local day_tweets
+                day_tweets=$(getDayTweets "$month_tweets" "$target_date")
 
-            local week_summary
-            week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$week_num")
+                local day_tweet_count
+                day_tweet_count=$(echo "$day_tweets" | jq 'length')
 
-            saveWeeklySummary "$week_summary" "$YEAR" "$((month * 4 + week_num))"
-
-            # 新規用語をglossaryに追加
-            local new_terms
-            new_terms=$(extractNewTermsFromSummary "$week_summary")
-            glossary=$(mergeNewTerms "$glossary" "$new_terms")
-        else
-            # 各週を個別に処理
-            local week_counter=1
-            for week_num in $weeks_in_month; do
-                showProgress "$month" "$week_counter"
-
-                local week_tweets
-                week_tweets=$(getWeekTweets "$month_tweets" "$week_num")
-
-                local week_tweet_count
-                week_tweet_count=$(echo "$week_tweets" | jq 'length')
-
-                if [[ "$week_tweet_count" -eq 0 || "$week_tweets" == "[]" ]]; then
-                    echo "[Info] No tweets for week $week_num, skipping..."
-                    ((week_counter++))
+                if [[ "$day_tweet_count" -eq 0 || "$day_tweets" == "[]" ]]; then
+                    echo "[Info] No tweets for $target_date, skipping..."
                     continue
                 fi
 
-                echo "[Info] Processing $week_tweet_count tweets for week $week_num"
+                echo "[Info] Processing $day_tweet_count tweets for $target_date"
 
                 local formatted_tweets
-                formatted_tweets=$(echo "$week_tweets" | formatTweetsForContext)
+                formatted_tweets=$(echo "$day_tweets" | formatTweetsForContext)
+
+                # 日次サマリー生成（processWeekを流用、week_numの代わりに日付を使用）
+                local day_summary
+                day_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$target_date")
+
+                saveDailySummary "$day_summary" "$target_date"
+
+                # 新規用語をglossaryに追加
+                local new_terms
+                new_terms=$(extractNewTermsFromSummary "$day_summary")
+                glossary=$(mergeNewTerms "$glossary" "$new_terms")
+            done
+        else
+            # 週単位処理（デフォルト）
+            local weeks_in_month
+            weeks_in_month=$(getWeeksInMonth "$filtered_tweets" "$month")
+
+            if [[ -z "$weeks_in_month" ]]; then
+                # 週番号が取得できない場合は月全体を1つとして処理
+                local week_num=1
+                showProgress "$month" "$week_num"
+
+                local formatted_tweets
+                formatted_tweets=$(echo "$month_tweets" | formatTweetsForContext)
 
                 local week_summary
-                week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$week_counter")
+                week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$week_num")
 
-                saveWeeklySummary "$week_summary" "$YEAR" "$week_num"
+                saveWeeklySummary "$week_summary" "$YEAR" "$((month * 4 + week_num))"
 
                 # 新規用語をglossaryに追加
                 local new_terms
                 new_terms=$(extractNewTermsFromSummary "$week_summary")
                 glossary=$(mergeNewTerms "$glossary" "$new_terms")
+            else
+                # 各週を個別に処理
+                local week_counter=1
+                for week_num in $weeks_in_month; do
+                    showProgress "$month" "$week_counter"
 
-                ((week_counter++))
-            done
+                    local week_tweets
+                    week_tweets=$(getWeekTweets "$month_tweets" "$week_num")
+
+                    local week_tweet_count
+                    week_tweet_count=$(echo "$week_tweets" | jq 'length')
+
+                    if [[ "$week_tweet_count" -eq 0 || "$week_tweets" == "[]" ]]; then
+                        echo "[Info] No tweets for week $week_num, skipping..."
+                        ((week_counter++))
+                        continue
+                    fi
+
+                    echo "[Info] Processing $week_tweet_count tweets for week $week_num"
+
+                    local formatted_tweets
+                    formatted_tweets=$(echo "$week_tweets" | formatTweetsForContext)
+
+                    local week_summary
+                    week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$week_counter")
+
+                    saveWeeklySummary "$week_summary" "$YEAR" "$week_num"
+
+                    # 新規用語をglossaryに追加
+                    local new_terms
+                    new_terms=$(extractNewTermsFromSummary "$week_summary")
+                    glossary=$(mergeNewTerms "$glossary" "$new_terms")
+
+                    ((week_counter++))
+                done
+            fi
         fi
 
         # 月次レポート生成
@@ -1259,6 +1375,8 @@ main() {
     monthly_reports_count=$(ls -1 "$YEAR_OUTPUT_DIR"/*-review.md 2>/dev/null | wc -l | tr -d ' ')
     local weekly_summaries_count
     weekly_summaries_count=$(ls -1 "$YEAR_OUTPUT_DIR/weekly-summaries"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    local daily_summaries_count
+    daily_summaries_count=$(ls -1 "$YEAR_OUTPUT_DIR/daily-summaries"/*.md 2>/dev/null | wc -l | tr -d ' ')
     local glossary_terms_count
     glossary_terms_count=$(jq 'length' "$YEAR_OUTPUT_DIR/glossary.json" 2>/dev/null || echo "0")
 
@@ -1268,9 +1386,14 @@ main() {
     echo ""
     echo "=== 処理統計 ==="
     echo "対象年: ${YEAR}年"
+    echo "粒度: $GRANULARITY"
     echo "処理ツイート数: $tweet_count"
     echo "月次レポート数: $monthly_reports_count"
-    echo "週次サマリー数: $weekly_summaries_count"
+    if [[ "$GRANULARITY" == "daily" ]]; then
+        echo "日次サマリー数: $daily_summaries_count"
+    else
+        echo "週次サマリー数: $weekly_summaries_count"
+    fi
     echo "用語辞書登録数: $glossary_terms_count"
 
     # トークン・コスト・時間の統計を出力・保存
