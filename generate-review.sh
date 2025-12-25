@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # デフォルト値
 TWEETS_FILE="$SCRIPT_DIR/twitter-*/data/tweets.js"
+TWITTER_DATA_DIR=""  # tweets.jsのあるディレクトリ（自動設定）
 YEAR="2025"
 MONTH=""  # 空の場合は全月処理
 GRANULARITY="weekly"  # weekly or daily
@@ -197,7 +198,7 @@ addToCache() {
 # 画像解析関数
 # =============================================================================
 
-# ツイートから画像URLを抽出（photoのみ、引用ツイート含む）
+# ツイートから画像ローカルパスを抽出（photoのみ、引用ツイート含む）
 extractImagesFromTweets() {
     local tweets_json="$1"
 
@@ -209,7 +210,7 @@ extractImagesFromTweets() {
         all_tweets_arg="--argjson allTweets []"
     fi
 
-    echo "$tweets_json" | jq -r $all_tweets_arg '
+    echo "$tweets_json" | jq -r $all_tweets_arg --arg dataDir "$TWITTER_DATA_DIR" '
         # 引用ツイートのステータスIDを抽出する関数
         def extract_status_id:
             capture("(?:x\\.com|twitter\\.com)/[^/]+/status/(?<id>[0-9]+)") | .id;
@@ -222,15 +223,24 @@ extractImagesFromTweets() {
         def find_tweet_by_id(id):
             normalize_all_tweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
 
-        # ツイートから画像を抽出
+        # URLからファイル名を抽出してローカルパスを構築
+        def to_local_path(tweet_id; media_url):
+            (media_url | split("/") | last) as $filename |
+            "\($dataDir)/tweets_media/\(tweet_id)-\($filename)";
+
+        # ツイートから画像情報を抽出
         def extract_images(tweet):
-            [(tweet.extended_entities.media // [])[] | select(.type == "photo") | .media_url_https] // [];
+            [(tweet.extended_entities.media // [])[] | select(.type == "photo") |
+             {tweet_id: tweet.id_str, media_url: .media_url_https}] // [];
 
         [.[] |
          .tweet as $tweet |
 
          # メインツイートの画像
-         (extract_images($tweet) | map({tweet_id: $tweet.id_str, media_url: .})) +
+         (extract_images($tweet) | map({
+            tweet_id: .tweet_id,
+            local_path: to_local_path(.tweet_id; .media_url)
+         })) +
 
          # 引用ツイートの画像
          ([($tweet.entities.urls[]? | select(.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/")) | .expanded_url)] |
@@ -238,22 +248,29 @@ extractImagesFromTweets() {
             (. | extract_status_id) as $status_id |
             (find_tweet_by_id($status_id)) as $quoted |
             if $quoted != null then
-              extract_images($quoted.tweet) | map({tweet_id: $quoted.tweet.id_str, media_url: .})
+              extract_images($quoted.tweet) | map({
+                tweet_id: .tweet_id,
+                local_path: to_local_path(.tweet_id; .media_url)
+              })
             else
               []
             end
           ) | flatten)
-        ] | flatten | unique_by(.media_url)
+        ] | flatten | unique_by(.local_path)
     '
 }
 
 # 単一画像を解析
 analyzeImage() {
-    local media_url="$1"
+    local local_path="$1"
     local timeout="${2:-60}"
 
+    local prompt_template
+    prompt_template=$(cat "$SCRIPT_DIR/templates/image-prompt.md")
+    local prompt="${prompt_template//\{\{IMAGE_PATH\}\}/$local_path}"
+
     local result
-    if result=$(timeout "$timeout" claude -p "この画像の内容を50文字以内で簡潔に日本語で説明してください。イラスト、写真、スクリーンショットなど種類も含めて。" --image "$media_url" --output-format json 2>/dev/null); then
+    if result=$(timeout "$timeout" claude -p "$prompt" --output-format json 2>/dev/null); then
         echo "$result" | jq -r '.result // "（解析失敗）"'
     else
         echo "（解析失敗）"
@@ -285,12 +302,12 @@ analyzeImagesForPeriod() {
     local analyzed=0
     local cached=0
     while IFS= read -r image_info; do
-        local media_url
-        media_url=$(echo "$image_info" | jq -r '.media_url')
+        local local_path
+        local_path=$(echo "$image_info" | jq -r '.local_path')
 
         # キャッシュ確認
         local cached_desc
-        cached_desc=$(getFromCache "$media_url")
+        cached_desc=$(getFromCache "$local_path")
 
         if [[ -n "$cached_desc" ]]; then
             ((cached++))
@@ -298,10 +315,10 @@ analyzeImagesForPeriod() {
         fi
 
         # 新規解析
-        echo "[Info] Analyzing image: $media_url" >&2
+        echo "[Info] Analyzing image: $local_path" >&2
         local description
-        description=$(analyzeImage "$media_url")
-        addToCache "$media_url" "$description"
+        description=$(analyzeImage "$local_path")
+        addToCache "$local_path" "$description"
         ((analyzed++))
 
     done < <(echo "$images" | jq -c '.[]')
@@ -350,7 +367,9 @@ validateInput() {
 
     # 展開されたパスを設定
     TWEETS_FILE="$expanded_file"
+    TWITTER_DATA_DIR="$(dirname "$TWEETS_FILE")"
     echo "[Info] Input file: $TWEETS_FILE"
+    echo "[Info] Data directory: $TWITTER_DATA_DIR"
 }
 
 # 依存ツール確認
