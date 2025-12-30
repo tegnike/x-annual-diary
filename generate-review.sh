@@ -591,7 +591,7 @@ saveLog() {
             type: $type,
             identifier: $id,
             timestamp: $timestamp,
-            prompt_preview: ($content | split("\n")[0:5] | join("\n")),
+            prompt: $content,
             result: $result
         }' > "$log_file"
 
@@ -801,8 +801,10 @@ getImageCacheJson() {
 # グローバル変数 ALL_TWEETS_FILE を参照して引用元を検索
 # グローバル変数 IMAGE_CACHE を参照して画像説明を取得
 formatTweetsForContext() {
-    local image_cache_json
-    image_cache_json=$(getImageCacheJson)
+    # 画像キャッシュを一時ファイルに書き出し（引数長制限回避）
+    local image_cache_file
+    image_cache_file=$(mktemp)
+    getImageCacheJson > "$image_cache_file"
 
     # 一時ファイルが存在しない場合は空配列を使用
     local all_tweets_arg=""
@@ -812,7 +814,7 @@ formatTweetsForContext() {
         all_tweets_arg="--argjson allTweets []"
     fi
 
-    jq -r $all_tweets_arg --argjson imageCache "$image_cache_json" '
+    jq -r $all_tweets_arg --slurpfile imageCache "$image_cache_file" --arg dataDir "$TWITTER_DATA_DIR" '
         # 引用ツイートのステータスIDを抽出する関数
         def extract_status_id:
             capture("(?:x\\.com|twitter\\.com)/[^/]+/status/(?<id>[0-9]+)") | .id;
@@ -825,9 +827,14 @@ formatTweetsForContext() {
         def find_tweet_by_id(id):
             normalize_all_tweets | map(select(.tweet.id_str == id or .tweet.id == id)) | first // null;
 
-        # 画像説明を取得
-        def get_image_description(url):
-            $imageCache[url] // null;
+        # URLからファイル名を抽出してローカルパスを構築
+        def to_local_path(tweet_id; media_url):
+            (media_url | split("/") | last) as $filename |
+            "\($dataDir)/tweets_media/\(tweet_id)-\($filename)";
+
+        # 画像説明を取得（slurpfileで読み込むため[0]でアクセス、ローカルパスをキーとして使用）
+        def get_image_description(local_path):
+            $imageCache[0][local_path] // null;
 
         .[] |
         .tweet as $tweet |
@@ -835,18 +842,18 @@ formatTweetsForContext() {
         # 引用ツイートURLを抽出
         ([$tweet.entities.urls[]? | select(.expanded_url != null and (.expanded_url | test("(x\\.com|twitter\\.com)/[^/]+/status/"))) | .expanded_url] // []) as $quote_urls |
 
-        # 画像URLを抽出（photoのみ）
-        ([($tweet.extended_entities.media // [])[] | select(.type == "photo") | .media_url_https] // []) as $image_urls |
+        # 画像情報を抽出（photoのみ、tweet_idとmedia_urlを含む）
+        ([($tweet.extended_entities.media // [])[] | select(.type == "photo") | {tweet_id: $tweet.id_str, media_url: .media_url_https}] // []) as $images |
 
         # 基本情報
         "---\n日時: \($tweet.created_at)\n本文: \($tweet.full_text)" +
 
         # 添付画像があれば追加
-        if ($image_urls | length) > 0 then
+        if ($images | length) > 0 then
             "\n添付画像:" +
-            ($image_urls | map(
-                . as $url |
-                (get_image_description($url)) as $desc |
+            ($images | map(
+                to_local_path(.tweet_id; .media_url) as $local_path |
+                (get_image_description($local_path)) as $desc |
                 if $desc != null then
                     "\n  - \($desc)"
                 else
@@ -864,7 +871,26 @@ formatTweetsForContext() {
                 ($url | extract_status_id) as $status_id |
                 (find_tweet_by_id($status_id)) as $quoted |
                 if $quoted != null then
-                    "\n\n  ┗ 引用ツイート:\n    日時: \($quoted.tweet.created_at)\n    本文: \($quoted.tweet.full_text | gsub("\n"; "\n    "))"
+                    # 引用ツイートの画像を抽出
+                    ([($quoted.tweet.extended_entities.media // [])[] | select(.type == "photo") | {tweet_id: $quoted.tweet.id_str, media_url: .media_url_https}] // []) as $quoted_images |
+
+                    "\n\n  ┗ 引用ツイート:\n    日時: \($quoted.tweet.created_at)\n    本文: \($quoted.tweet.full_text | gsub("\n"; "\n    "))" +
+
+                    # 引用ツイートの画像説明を追加
+                    if ($quoted_images | length) > 0 then
+                        "\n    添付画像:" +
+                        ($quoted_images | map(
+                            to_local_path(.tweet_id; .media_url) as $local_path |
+                            (get_image_description($local_path)) as $desc |
+                            if $desc != null then
+                                "\n      - \($desc)"
+                            else
+                                ""
+                            end
+                        ) | join(""))
+                    else
+                        ""
+                    end
                 else
                     "\n\n  ┗ 引用URL: \($url)"
                 end
@@ -874,6 +900,9 @@ formatTweetsForContext() {
         end +
         "\n---"
     '
+    local exit_code=$?
+    rm -f "$image_cache_file"
+    return $exit_code
 }
 
 # =============================================================================
@@ -938,6 +967,25 @@ logFailedTerm() {
     local timestamp
     timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     echo "[$timestamp] FAILED: term=\"$term\" reason=\"$reason\"" >> "$log_file"
+}
+
+# ツイートに含まれる用語だけを辞書から抽出
+# 引数: ツイートテキスト（結合済み）, 用語辞書JSON
+# 出力: フィルタリングされた用語辞書JSON
+filterGlossaryByTweets() {
+    local tweets_text="$1"
+    local glossary_json="$2"
+
+    # 辞書が空の場合はそのまま返す
+    if [[ -z "$glossary_json" || "$glossary_json" == "{}" ]]; then
+        echo "{}"
+        return
+    fi
+
+    # ツイートテキストに含まれる用語だけを抽出
+    echo "$glossary_json" | jq --arg text "$tweets_text" '
+        to_entries | map(select(.key as $k | $text | test($k; "i"))) | from_entries
+    ' 2>/dev/null || echo "{}"
 }
 
 # =============================================================================
@@ -1780,6 +1828,13 @@ main() {
             for target_date in $days_in_month; do
                 echo "[Progress] Processing: $target_date"
 
+                # 既存の日次サマリーがあればスキップ
+                local existing_summary="$YEAR_OUTPUT_DIR/daily-summaries/${target_date}.md"
+                if [[ -f "$existing_summary" ]]; then
+                    echo "[Info] Daily summary already exists for $target_date, skipping..."
+                    continue
+                fi
+
                 local day_tweets
                 day_tweets=$(getDayTweets "$month_tweets" "$target_date")
 
@@ -1801,9 +1856,15 @@ main() {
                 formatted_tweets=$(echo "$day_tweets" | formatTweetsForContext)
                 echo "[Debug] Formatting complete. Calling Claude Code..." >&2
 
+                # ツイートに関連する用語だけを辞書から抽出
+                local tweets_text
+                tweets_text=$(echo "$day_tweets" | jq -r '.[].tweet.full_text' | tr '\n' ' ')
+                local filtered_glossary
+                filtered_glossary=$(filterGlossaryByTweets "$tweets_text" "$glossary")
+
                 # 日次サマリー生成
                 local day_summary
-                day_summary=$(processDay "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$target_date")
+                day_summary=$(processDay "$formatted_tweets" "$cumulative_summary" "$filtered_glossary" "$month" "$target_date")
 
                 saveDailySummary "$day_summary" "$target_date"
 
@@ -1828,8 +1889,14 @@ main() {
                 local formatted_tweets
                 formatted_tweets=$(echo "$month_tweets" | formatTweetsForContext)
 
+                # ツイートに関連する用語だけを辞書から抽出
+                local tweets_text
+                tweets_text=$(echo "$month_tweets" | jq -r '.[].tweet.full_text' | tr '\n' ' ')
+                local filtered_glossary
+                filtered_glossary=$(filterGlossaryByTweets "$tweets_text" "$glossary")
+
                 local week_summary
-                week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$week_num")
+                week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$filtered_glossary" "$month" "$week_num")
 
                 saveWeeklySummary "$week_summary" "$YEAR" "$((month * 4 + week_num))"
 
@@ -1842,6 +1909,16 @@ main() {
                 local week_counter=1
                 for week_num in $weeks_in_month; do
                     showProgress "$month" "$week_counter"
+
+                    # 既存の週次サマリーがあればスキップ
+                    local week_padded
+                    week_padded=$(printf '%02d' $((10#$week_num)))
+                    local existing_weekly="$YEAR_OUTPUT_DIR/weekly-summaries/${YEAR}-W${week_padded}.md"
+                    if [[ -f "$existing_weekly" ]]; then
+                        echo "[Info] Weekly summary already exists for week $week_num, skipping..."
+                        ((week_counter++))
+                        continue
+                    fi
 
                     local week_tweets
                     week_tweets=$(getWeekTweets "$month_tweets" "$week_num")
@@ -1863,8 +1940,14 @@ main() {
                     local formatted_tweets
                     formatted_tweets=$(echo "$week_tweets" | formatTweetsForContext)
 
+                    # ツイートに関連する用語だけを辞書から抽出
+                    local tweets_text
+                    tweets_text=$(echo "$week_tweets" | jq -r '.[].tweet.full_text' | tr '\n' ' ')
+                    local filtered_glossary
+                    filtered_glossary=$(filterGlossaryByTweets "$tweets_text" "$glossary")
+
                     local week_summary
-                    week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$glossary" "$month" "$week_counter")
+                    week_summary=$(processWeek "$formatted_tweets" "$cumulative_summary" "$filtered_glossary" "$month" "$week_counter")
 
                     saveWeeklySummary "$week_summary" "$YEAR" "$week_num"
 
